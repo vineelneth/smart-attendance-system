@@ -1,6 +1,6 @@
 # smart-attendance-system
 A Python facial recognition pipeline optimized for 96% precision with blur detection.
-# 🤖 Smart Attendance System
+# Smart Attendance System
 
 An automated, real-time facial recognition attendance system built with Python, OpenCV, and deep metric learning. This project replaces manual roll-calls with a high-precision, automated CSV logging pipeline.
 
