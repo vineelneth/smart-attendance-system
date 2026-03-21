@@ -1,4 +1,4 @@
-# smart-attendace-system
+# smart-attendance-system
 A Python facial recognition pipeline optimized for 96% precision with blur detection.
 # 🤖 Smart Attendance System
 
