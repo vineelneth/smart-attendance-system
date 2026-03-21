@@ -1,0 +1,9 @@
+# Core Machine Learning & Vision Libraries
+face-recognition
+opencv-python
+numpy
+
+# NOTE FOR WINDOWS USERS: 
+# The 'face-recognition' library requires 'dlib' to compile. 
+# You must have 'CMake' installed on your system before running:
+# pip install -r requirements.txt
