@@ -7,7 +7,7 @@ import csv
 # --- Configuration ---
 KNOWN_FACES_DIR = "known_faces"
 TEST_FACES_DIR = "test_dataset"
-GROUND_TRUTH_FILE = "ground_truth.csv"
+GROUND_TRUTH_FILE = "data.csv"
 DISTANCE_THRESHOLD = 0.55  # The parameter you will tune!
 
 # --- Step 1: Load Known Faces ---
