@@ -1,208 +1,244 @@
-import face_recognition
-import cv2
-import numpy as np
-import os
+"""Real-time webcam-based facial recognition attendance system."""
+
 import csv
+import os
+import sys
 from datetime import datetime
+from typing import Optional
 
-# --- Configuration ---
-KNOWN_FACES_DIR = "known_faces"
-STUDENTS_LIST_FILE = "students_list.txt"
-DISTANCE_THRESHOLD = 0.55  # Updated from 0.48 based on evaluation tuning
+import cv2
+import face_recognition
+import numpy as np
 
-# ---------- STEP 1: Load known faces ----------
-known_encodings = []
-known_names = []
+from config import (
+    DISTANCE_THRESHOLD,
+    FACE_AREA_SCALE,
+    FACE_AREA_WEIGHT,
+    FRAME_DELAY_MS,
+    KNOWN_FACES_DIR,
+    SHARPNESS_WEIGHT,
+    STUDENTS_LIST_FILE,
+    TOTAL_FRAMES,
+    WARMUP_FRAMES,
+)
 
-print("Loading known faces...")
-for file in os.listdir(KNOWN_FACES_DIR):
-    if file.lower().endswith((".jpg", ".jpeg", ".png")):
-        img_path = os.path.join(KNOWN_FACES_DIR, file)
-        img = face_recognition.load_image_file(img_path)
+_RESULT_WINDOW = "Smart Attendance — Result  (r=Retake | n=Next | q=Quit)"
+
+
+def load_known_faces(directory: str) -> tuple[list, list]:
+    """Load face encodings and names from all images in *directory*.
+
+    Returns:
+        (encodings, names) — parallel lists of face encodings and student names.
+    """
+    if not os.path.isdir(directory):
+        print(
+            f"Error: '{directory}/' not found.\n"
+            "Create it and add one reference photo per student named 'StudentName.jpg'.\n"
+            "See README for details."
+        )
+        sys.exit(1)
+
+    encodings: list = []
+    names: list = []
+
+    for file in os.listdir(directory):
+        if not file.lower().endswith((".jpg", ".jpeg", ".png")):
+            continue
+        img = face_recognition.load_image_file(os.path.join(directory, file))
         enc = face_recognition.face_encodings(img)
-        if len(enc) > 0:
-            known_encodings.append(enc[0])
-            known_names.append(os.path.splitext(file)[0].upper())
+        if enc:
+            encodings.append(enc[0])
+            names.append(os.path.splitext(file)[0].upper())
         else:
-            print(f"[Warning] No face found in {file}")
+            print(f"[Warning] No face detected in '{file}' — skipping.")
 
-# ---------- STEP 2: Read student list ----------
-try:
-    with open(STUDENTS_LIST_FILE, "r") as f:
-        all_students = [line.strip().upper() for line in f.readlines()]
-except FileNotFoundError:
-    print(f"Error: '{STUDENTS_LIST_FILE}' not found. Please create it.")
-    exit()
+    if not encodings:
+        print(f"Error: No valid face images found in '{directory}/'.")
+        sys.exit(1)
 
-present_students = set()
+    print(f"Loaded {len(encodings)} known face(s).")
+    return encodings, names
 
 
-# ---------- Helper Functions ----------
-def measure_sharpness(img):
+def load_student_list(filepath: str) -> list[str]:
+    """Load enrolled student names from a plain-text file (one name per line)."""
+    if not os.path.isfile(filepath):
+        print(
+            f"Error: '{filepath}' not found.\n"
+            "Create it with one student name per line (uppercase)."
+        )
+        sys.exit(1)
+    with open(filepath) as f:
+        students = [line.strip().upper() for line in f if line.strip()]
+    print(f"Loaded {len(students)} enrolled student(s).")
+    return students
+
+
+def measure_sharpness(img: np.ndarray) -> float:
+    """Return the Laplacian variance of *img* as a sharpness proxy."""
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    return cv2.Laplacian(gray, cv2.CV_64F).var()
+    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
 
-def frame_quality_score(frame):
+def frame_quality_score(frame: np.ndarray) -> tuple[float, Optional[list]]:
+    """Score *frame* by a weighted combination of sharpness and detected face area.
+
+    Returns:
+        (score, face_locations) — score is 0.0 and locations is None if no face found.
+    """
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     faces = face_recognition.face_locations(rgb)
-    if len(faces) == 0:
-        return 0, None
+    if not faces:
+        return 0.0, None
     sharpness = measure_sharpness(frame)
-    face_areas = [(r - l) * (b - t) for (t, r, b, l) in faces]
-    avg_face_area = np.mean(face_areas)
-    score = 0.7 * sharpness + 0.3 * avg_face_area / 1000
+    avg_face_area = float(np.mean([(r - l) * (b - t) for (t, r, b, l) in faces]))
+    score = SHARPNESS_WEIGHT * sharpness + FACE_AREA_WEIGHT * avg_face_area / FACE_AREA_SCALE
     return score, faces
 
 
-def capture_best_frame(cap):
-    """Capture frames 5 to 15 and pick the best (clearest) one."""
-    frames, scores, face_sets = [], [], []
-    total_frames = 15
+def capture_best_frame(cap: cv2.VideoCapture) -> tuple[Optional[np.ndarray], Optional[list]]:
+    """Capture TOTAL_FRAMES frames and return the sharpest one containing faces.
 
-    for i in range(total_frames):
+    The first WARMUP_FRAMES are discarded so the camera's auto-exposure can settle.
+    Returns (None, None) if 'q' is pressed or no usable frame is found.
+    """
+    frames: list[np.ndarray] = []
+    scores: list[float] = []
+    face_sets: list[Optional[list]] = []
+
+    for i in range(TOTAL_FRAMES):
         ret, frame = cap.read()
         if not ret:
             continue
 
         cv2.putText(
-            frame,
-            f"Capturing frame {i+1}/{total_frames}",
-            (20, 40),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
-            (255, 255, 255),
-            2,
+            frame, f"Capturing {i + 1}/{TOTAL_FRAMES}",
+            (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2,
         )
-        cv2.imshow("Capturing Best Frame", frame)
-        cv2.waitKey(150)
-
-        if cv2.waitKey(1) & 0xFF == ord("q"):
+        cv2.imshow("Smart Attendance — Capturing", frame)
+        if cv2.waitKey(FRAME_DELAY_MS) & 0xFF == ord("q"):
             return None, None
 
-        # Store only frames 5 to 15
-        if i >= 4:
+        if i >= WARMUP_FRAMES:
+            score, locs = frame_quality_score(frame)
             frames.append(frame)
+            scores.append(score)
+            face_sets.append(locs)
 
     if not frames:
-        print("No frames captured between 5 and 15.")
+        print("[Warning] No frames captured after warmup period.")
         return None, None
 
-    # Evaluate sharpness and face clarity only for frames 5–15
-    for f in frames:
-        s, locs = frame_quality_score(f)
-        scores.append(s)
-        face_sets.append(locs)
-
-    best_idx = np.argmax(scores)
+    best_idx = int(np.argmax(scores))
     best_frame = frames[best_idx]
     best_faces = face_sets[best_idx]
 
     if not best_faces:
-        print("No clear faces detected in frames 5–15.")
+        print("No clear faces detected. Try again.")
         return None, None
 
-    print(f"Best frame selected (from frames 5–15) -> Frame #{best_idx + 5}")
+    print(f"Best frame: #{best_idx + WARMUP_FRAMES + 1}  |  {len(best_faces)} face(s) detected.")
     return best_frame, best_faces
 
 
-def recognize_faces(best_frame, best_faces):
-    """Recognize all known faces in selected frame."""
-    rgb_best = cv2.cvtColor(best_frame, cv2.COLOR_BGR2RGB)
-    face_encodings = face_recognition.face_encodings(rgb_best, best_faces)
+def recognize_faces(
+    frame: np.ndarray,
+    face_locations: list,
+    known_encodings: list,
+    known_names: list,
+    present_students: set,
+) -> None:
+    """Identify faces in *frame*, annotate it, and add matches to *present_students*."""
+    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    encodings = face_recognition.face_encodings(rgb_frame, face_locations)
 
-    for face_encoding, face_loc in zip(face_encodings, best_faces):
-        distances = face_recognition.face_distance(known_encodings, face_encoding)
+    for encoding, loc in zip(encodings, face_locations):
+        distances = face_recognition.face_distance(known_encodings, encoding)
         if len(distances) == 0:
             continue
 
-        min_distance = np.min(distances)
-        if min_distance < DISTANCE_THRESHOLD:
-            name = known_names[np.argmin(distances)]
+        min_dist = float(np.min(distances))
+        y1, x2, y2, x1 = loc
+
+        if min_dist < DISTANCE_THRESHOLD:
+            name = known_names[int(np.argmin(distances))]
             present_students.add(name)
-            y1, x2, y2, x1 = face_loc
-            cv2.rectangle(best_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            cv2.putText(
-                best_frame,
-                name,
-                (x1 + 6, y2 + 25),
-                cv2.FONT_HERSHEY_DUPLEX,
-                0.8,
-                (0, 255, 0),
-                2,
-            )
+            color = (0, 255, 0)
+            label = name
         else:
-            y1, x2, y2, x1 = face_loc
-            cv2.rectangle(best_frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
-            cv2.putText(
-                best_frame,
-                "Unknown",
-                (x1 + 6, y2 + 25),
-                cv2.FONT_HERSHEY_DUPLEX,
-                0.8,
-                (0, 0, 255),
-                2,
-            )
+            color = (0, 0, 255)
+            label = "Unknown"
 
-    cv2.imshow("Result - Press 'r' to Retake, 'n' for Next, 'q' to Quit", best_frame)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+        cv2.putText(frame, label, (x1 + 6, y2 + 25), cv2.FONT_HERSHEY_DUPLEX, 0.8, color, 2)
+
+    cv2.imshow(_RESULT_WINDOW, frame)
 
 
-# ---------- STEP 3: Initialize Camera ----------
-cap = cv2.VideoCapture(0)
-if not cap.isOpened():
-    print("Error: Cannot access webcam.")
-    exit()
+def save_attendance(all_students: list[str], present_students: set) -> str:
+    """Write a timestamped attendance CSV and return its filename."""
+    now = datetime.now()
+    filename = f"Attendance_{now.strftime('%Y-%m-%d_%H-%M-%S')}.csv"
+    timestamp = now.strftime("%H:%M:%S")
+    with open(filename, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["Student Name", "Status", "Timestamp"])
+        for name in all_students:
+            writer.writerow([name, "Present" if name in present_students else "Absent", timestamp])
+    return filename
 
-print(
-    "\nCamera ready! Press keys to control:\n'r' = Retake, 'n' = Next group, 'q' = Quit\n"
-)
 
-# ---------- STEP 4: Main Loop ----------
-goto_exit = False
-while not goto_exit:
-    best_frame, best_faces = capture_best_frame(cap)
-    if best_frame is None:
-        continue
+def print_summary(all_students: list[str], present_students: set, filename: str) -> None:
+    """Print a human-readable attendance summary."""
+    absent = sorted(s for s in all_students if s not in present_students)
+    print("\n--- Attendance Summary ---")
+    print(f"Present ({len(present_students)}): {', '.join(sorted(present_students)) or 'None'}")
+    print(f"Absent  ({len(absent)}):  {', '.join(absent) or 'None'}")
+    print(f"\nSaved: {filename}")
 
-    print(f"Best frame selected with {len(best_faces)} face(s).")
-    recognize_faces(best_frame, best_faces)
 
-    while True:
-        key = cv2.waitKey(0) & 0xFF  # Wait for key input
-        if key == ord("r"):  # Retake
-            print("\nRetaking current group...")
-            cv2.destroyWindow("Result - Press 'r' to Retake, 'n' for Next, 'q' to Quit")
-            break
-        elif key == ord("n"):  # Next
-            print("\nMoving to next group...")
-            cv2.destroyWindow("Result - Press 'r' to Retake, 'n' for Next, 'q' to Quit")
-            break
-        elif key == ord("q"):  # Quit
-            print("\nExiting and saving attendance...")
-            cap.release()
-            cv2.destroyAllWindows()
-            goto_exit = True
-            break
+def main() -> None:
+    print("Loading known faces...")
+    known_encodings, known_names = load_known_faces(KNOWN_FACES_DIR)
+    all_students = load_student_list(STUDENTS_LIST_FILE)
+    present_students: set[str] = set()
 
-# ---------- STEP 5: Save Attendance ----------
-absent_students = [s for s in all_students if s not in present_students]
-now = datetime.now()
-filename = f"Attendance_{now.strftime('%Y-%m-%d_%H-%M-%S')}.csv"
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("Error: Cannot open webcam.")
+        sys.exit(1)
 
-with open(filename, "w", newline="") as f:
-    writer = csv.writer(f)
-    writer.writerow(["Student Name", "Status", "Timestamp"])
-    for name in all_students:
-        status = "Present" if name in present_students else "Absent"
-        writer.writerow([name, status, now.strftime("%H:%M:%S")])
+    print("\nCamera ready.  Controls:  r = Retake  |  n = Next group  |  q = Quit\n")
 
-print("\nAttendance Summary:")
-print("\nPresent Students:")
-for s in sorted(present_students):
-    print("  -", s)
+    try:
+        while True:
+            best_frame, best_faces = capture_best_frame(cap)
+            if best_frame is None:
+                break
 
-print("\nAbsent Students:")
-for s in sorted(absent_students):
-    print("  -", s)
+            recognize_faces(best_frame, best_faces, known_encodings, known_names, present_students)
 
-print(f"\nAttendance saved in: {filename}")
+            while True:
+                key = cv2.waitKey(0) & 0xFF
+                if key == ord("r"):
+                    print("Retaking...")
+                    cv2.destroyWindow(_RESULT_WINDOW)
+                    break
+                elif key == ord("n"):
+                    print("Next group...")
+                    cv2.destroyWindow(_RESULT_WINDOW)
+                    break
+                elif key == ord("q"):
+                    print("Saving attendance...")
+                    cv2.destroyWindow(_RESULT_WINDOW)
+                    return
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+        filename = save_attendance(all_students, present_students)
+        print_summary(all_students, present_students, filename)
+
+
+if __name__ == "__main__":
+    main()

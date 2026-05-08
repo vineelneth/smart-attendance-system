@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Generated attendance reports
+Attendance_*.csv
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# dlib / model build artifacts
+*.dat
+*.dat.bz2
+
+# Test images (large binary assets — add your own locally)
+known_faces/**
+!known_faces/.gitkeep
+test_dataset/**
+!test_dataset/.gitkeep
